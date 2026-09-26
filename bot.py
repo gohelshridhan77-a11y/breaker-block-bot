@@ -3,11 +3,11 @@ import os
 import requests
 from datetime import datetime, timezone, timedelta
 from fyers_apiv3 import fyersModel
+from token_manager import get_access_token
 
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID         = os.environ.get("CHAT_ID")
 FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
-FYERS_ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 
 # ════════════════════════════════
 # ALL SYMBOLS
@@ -37,10 +37,14 @@ FNO_STOCKS = [
     "NSE:BAJAJ-AUTO-EQ", "NSE:BRITANNIA-EQ", "NSE:EICHERMOT-EQ",
     "NSE:HEROMOTOCO-EQ", "NSE:M&M-EQ", "NSE:NESTLEIND-EQ",
     "NSE:SBILIFE-EQ", "NSE:HDFCLIFE-EQ", "NSE:INDUSINDBK-EQ",
-    "NSE:TATACONSUM-EQ", "NSE:UPL-EQ",
+    "NSE:TATACONSUM-EQ", "NSE:UPL-EQ", "NSE:PIDILITIND-EQ",
+    "NSE:SIEMENS-EQ", "NSE:HAVELLS-EQ", "NSE:VOLTAS-EQ",
+    "NSE:MUTHOOTFIN-EQ", "NSE:CHOLAFIN-EQ",
 ]
 
-TIMEFRAMES = ["15", "10", "60"]  # 15m, 10m, 1h
+TIMEFRAMES = ["10", "15", "60"]
+
+ACCESS_TOKEN = None
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -57,7 +61,6 @@ def is_market_open():
     ist = get_ist_time()
     if ist.weekday() > 4:
         return False
-    # NSE hours: 9:15 AM to 3:30 PM IST
     market_open  = ist.replace(hour=9,  minute=15, second=0)
     market_close = ist.replace(hour=15, minute=30, second=0)
     return market_open <= ist <= market_close
@@ -69,18 +72,19 @@ def get_timestamp():
 def get_fyers():
     return fyersModel.FyersModel(
         client_id=FYERS_CLIENT_ID,
-        token=FYERS_ACCESS_TOKEN,
+        token=ACCESS_TOKEN,
         log_path=""
     )
 
 def get_candles(symbol, timeframe):
     fyers = get_fyers()
+    today = datetime.now()
     data = {
         "symbol": symbol,
         "resolution": timeframe,
         "date_format": "1",
-        "range_from": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d"),
-        "range_to": datetime.now().strftime("%Y-%m-%d"),
+        "range_from": (today - timedelta(days=5)).strftime("%Y-%m-%d"),
+        "range_to": today.strftime("%Y-%m-%d"),
         "cont_flag": "1"
     }
     response = fyers.history(data=data)
@@ -95,27 +99,22 @@ def get_candles(symbol, timeframe):
             "low":   float(c[3]),
             "close": float(c[4]),
         })
-    return candles[-20:]  # Last 20 candles
+    return candles[-20:]
 
 def detect_breaker_block(candles):
-    """
-    Bullish Breaker Block Detection:
-    1. Find Swing High (Point B)
-    2. Price drops below previous low (Point A - SSL Swept)
-    3. Price reverses strongly upward
-    4. Alert when price closes above Point B
-    """
     if len(candles) < 10:
         return None
 
-    # Find recent swing high (Point B)
-    lookback = candles[-10:]
-    swing_high_idx = 0
-    swing_high = 0
+    lookback = candles[-15:]
 
-    for i in range(1, len(lookback) - 1):
+    # Find swing high (Point B)
+    swing_high = 0
+    swing_high_idx = 0
+    for i in range(2, len(lookback) - 2):
         if (lookback[i]["high"] > lookback[i-1]["high"] and
-            lookback[i]["high"] > lookback[i+1]["high"]):
+            lookback[i]["high"] > lookback[i-2]["high"] and
+            lookback[i]["high"] > lookback[i+1]["high"] and
+            lookback[i]["high"] > lookback[i+2]["high"]):
             if lookback[i]["high"] > swing_high:
                 swing_high = lookback[i]["high"]
                 swing_high_idx = i
@@ -125,42 +124,36 @@ def detect_breaker_block(candles):
 
     # Find swing low before B (Point A)
     pre_b = lookback[:swing_high_idx]
-    if not pre_b:
+    if len(pre_b) < 2:
         return None
 
     swing_low = min(c["low"] for c in pre_b)
 
-    # Check if price swept below A (SSL Swept)
-    post_b = lookback[swing_high_idx:]
-    ssl_swept = any(c["low"] < swing_low for c in post_b)
+    # Check SSL swept (price went below A after B)
+    post_b = lookback[swing_high_idx+1:]
+    if not post_b:
+        return None
 
+    ssl_swept = any(c["low"] < swing_low for c in post_b)
     if not ssl_swept:
         return None
 
-    # Check if current candle closes above B (Point B breakout)
+    # Check current candle closes above B
     current = candles[-1]
     prev    = candles[-2]
 
-    # Alert: Current candle closes above swing high (Point B)
     if current["close"] > swing_high and prev["close"] <= swing_high:
+        sl = swing_low
+        tp = current["close"] + (current["close"] - swing_low)
+        rr = round(abs(tp - current["close"]) / abs(current["close"] - sl), 2)
         return {
-            "type": "BREAKER_BLOCK_BREAKOUT",
-            "point_b": swing_high,
-            "point_a": swing_low,
-            "entry": current["close"],
-            "sl": swing_low,
-            "tp": current["close"] + (current["close"] - swing_low),
-        }
-
-    # Alert: Breaker Block formed (SSL swept + strong reversal)
-    if ssl_swept and current["close"] > swing_high * 0.999:
-        return {
-            "type": "BREAKER_BLOCK_FORMED",
-            "point_b": swing_high,
-            "point_a": swing_low,
-            "entry": current["close"],
-            "sl": swing_low,
-            "tp": current["close"] + (current["close"] - swing_low),
+            "type": "BREAKOUT",
+            "point_b": round(swing_high, 2),
+            "point_a": round(swing_low, 2),
+            "entry":   round(current["close"], 2),
+            "sl":      round(sl, 2),
+            "tp":      round(tp, 2),
+            "rr":      rr,
         }
 
     return None
@@ -172,77 +165,66 @@ def build_message(symbol, timeframe, signal):
         "60": "1Hour"
     }.get(timeframe, timeframe)
 
-    entry = signal["entry"]
-    sl    = signal["sl"]
-    tp    = signal["tp"]
-    risk  = abs(entry - sl)
-    rr    = round(abs(tp - entry) / risk, 2) if risk > 0 else 0
-
-    signal_type = (
-        "🚀 BREAKOUT ABOVE B"
-        if signal["type"] == "BREAKER_BLOCK_BREAKOUT"
-        else "📦 BREAKER BLOCK FORMED"
-    )
-
-    name = symbol.split(":")[1].replace("-EQ", "").replace("-INDEX", "")
+    name = symbol.split(":")[1]
+    name = name.replace("-EQ", "").replace("-INDEX", "")
 
     return (
         f"🟢 BULLISH BREAKER BLOCK\n"
         f"---------------\n"
-        f"Symbol  : {name}\n"
-        f"TF      : {tf_label}\n"
-        f"Signal  : {signal_type}\n"
-        f"Time    : {get_timestamp()}\n"
+        f"Symbol : {name}\n"
+        f"TF     : {tf_label}\n"
+        f"Time   : {get_timestamp()}\n"
         f"---------------\n"
-        f"Point B : {signal['point_b']}\n"
-        f"Point A : {signal['point_a']}\n"
+        f"Signal : Close above Point B!\n"
+        f"Point B: {signal['point_b']}\n"
+        f"Point A: {signal['point_a']}\n"
         f"---------------\n"
-        f"Entry   : {entry}\n"
-        f"SL      : {sl}\n"
-        f"TP      : {tp}\n"
-        f"RR      : 1:{rr}\n"
+        f"Entry  : {signal['entry']}\n"
+        f"SL     : {signal['sl']}\n"
+        f"TP     : {signal['tp']}\n"
+        f"RR     : 1:{signal['rr']}\n"
         f"---------------\n"
-        f"Action  : BUY NOW!"
+        f"Action : BUY NOW! 🚀"
     )
 
 def scan_all(last_signal_time):
     all_symbols = INDICES + FNO_STOCKS
-
     for symbol in all_symbols:
         for tf in TIMEFRAMES:
             key = f"{symbol}_{tf}"
             try:
                 candles = get_candles(symbol, tf)
                 signal  = detect_breaker_block(candles)
-
                 if signal:
                     current_time = time.time()
                     if current_time - last_signal_time.get(key, 0) > 3600:
-                        msg = build_message(symbol, tf, signal)
-                        send_message(msg)
+                        send_message(build_message(symbol, tf, signal))
                         last_signal_time[key] = current_time
-
-            except Exception as e:
-                pass  # Silent fail for individual symbols
-
-            time.sleep(1)  # Rate limit
-
+            except Exception:
+                pass
+            time.sleep(1)
     return last_signal_time
 
 def main():
-    send_message(
-        "🟢 Breaker Block Bot Running!\n"
-        "---------------\n"
-        "Indices : Nifty BankNifty\n"
-        "          FinNifty MidCap\n"
-        "          Sensex\n"
-        "FNO     : 50+ Stocks\n"
-        "---------------\n"
-        "TF      : 10m 15m 1h\n"
-        "Setup   : Bullish Breaker\n"
-        "Alert   : Close above B\n"
-        "Hours   : 9:15AM-3:30PM IST"
-    )
+    global ACCESS_TOKEN
+    try:
+        ACCESS_TOKEN = get_access_token()
+        send_message(
+            "🟢 Breaker Block Bot Running!\n"
+            "---------------\n"
+            "Indices: Nifty BankNifty\n"
+            "         FinNifty MidCap\n"
+            "         Sensex\n"
+            "Stocks : 55+ FNO Stocks\n"
+            "---------------\n"
+            "TF     : 10m 15m 1h\n"
+            "Setup  : Bullish Breaker Block\n"
+            "Alert  : Close above Point B\n"
+            "Hours  : 9:15AM-3:30PM IST"
+        )
+    except Exception as e:
+        send_message(f"Token error: {str(e)}")
+        return
 
     last_signal_time = {}
     market_was_open  = False
@@ -261,14 +243,11 @@ def main():
             continue
 
         if not market_was_open:
-            send_message(
-                "🔔 Market Open!\n"
-                "Breaker Block Bot Scanning..."
-            )
+            send_message("🔔 Market Open!\nBreaker Block Bot Scanning...")
             market_was_open = True
 
         last_signal_time = scan_all(last_signal_time)
-        time.sleep(300)  # Scan every 5 minutes
+        time.sleep(300)
 
 if __name__ == "__main__":
     main()
